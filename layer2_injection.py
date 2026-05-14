@@ -26,6 +26,8 @@ import os
 import json
 import pickle
 import warnings
+
+from sklearn.metrics import euclidean_distances
 warnings.filterwarnings('ignore')
 
 from sklearn.cluster import KMeans
@@ -243,7 +245,20 @@ def _strategy_high_value(X_real: np.ndarray,
         return _strategy_random(X_real, decoys, n_inject)
 
     from sklearn.metrics.pairwise import euclidean_distances
-    dists    = euclidean_distances(decoys, hv_records).min(axis=1)
+    sample_size = min(5000, len(hv_records))
+
+    indices = np.random.choice(
+    len(hv_records),
+    sample_size,
+    replace=False
+    )
+
+    hv_subset = hv_records[indices]
+
+    dists = euclidean_distances(
+    decoys,
+    hv_subset
+    ).min(axis=1)
     best_idx = np.argsort(dists)[:n_inject]
     return decoys[best_idx]
 

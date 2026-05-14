@@ -1,0 +1,10 @@
+{
+  "discriminator_accuracy": 1.0,
+  "discriminator_f1": 1.0,
+  "discriminator_precision": 1.0,
+  "discriminator_recall": 1.0,
+  "features_within_2sd": 13,
+  "mean_kl_divergence": 1.1337112686397974,
+  "mean_ks_pvalue": 1.5051782082301286e-08,
+  "quality_pass": false
+}

@@ -22,6 +22,7 @@ PaySim columns:
     isFlaggedFraud  - naive system flag (dropped - leakage)
 """
 
+from matplotlib.pylab import sample
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
@@ -53,23 +54,22 @@ def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Add derived numeric features that carry semantic meaning.
     All derived from raw columns — no leakage.
+
+    Note: balance-diff features (newbalanceOrig - oldbalanceOrg + amount)
+    are intentionally excluded — in PaySim they are algebraically near-zero
+    for fraud by construction, making them trivial discriminators that do
+    not generalise to real-world data.
     """
     df = df.copy()
-
-    # Balance error features: captures zero-out fraud pattern
-    # In PaySim, fraudulent TRANSFER/CASH-OUT often zero out sender balance
-    df['orig_balance_diff'] = df['newbalanceOrig'] - df['oldbalanceOrg'] + df['amount']
-    df['dest_balance_diff'] = df['newbalanceDest'] - df['oldbalanceDest'] - df['amount']
 
     # Ratio features: relative transaction size
     df['amount_to_orig_ratio'] = df['amount'] / (df['oldbalanceOrg'] + 1e-9)
     df['amount_to_dest_ratio'] = df['amount'] / (df['oldbalanceDest'] + 1e-9)
 
-    # Flag: sender completely emptied their account
-    df['orig_zeroed'] = (df['newbalanceOrig'] == 0).astype(int)
-
-    # Flag: only TRANSFER and CASH-OUT contain fraud in PaySim
-    df['is_risky_type'] = df['type'].isin(['TRANSFER', 'CASH_OUT']).astype(int)
+    # Note: orig_zeroed and is_risky_type removed — both are binary flags
+    # that GMM/autoencoder cannot reproduce faithfully, causing trivial
+    # real-vs-decoy separation. is_risky_type is also redundant given
+    # the one-hot type columns already present.
 
     return df
 
@@ -104,12 +104,13 @@ def load_and_preprocess(filepath: str,
     # ── 1. Load ──────────────────────────────────────────────
     print(f"\n[1/6] Loading dataset from: {filepath}")
     df = pd.read_csv(filepath)
+    # optional dataset sampling for faster experimentation
+    if sample_frac < 1.0:
+        df = df.sample(frac=sample_frac, random_state=42)
+
+    print(f"      Using sampled dataset: {df.shape}")
     print(f"      Raw shape : {df.shape}")
     print(f"      Fraud rate: {df['isFraud'].mean()*100:.4f}%")
-
-    if sample_frac < 1.0:
-        df = df.sample(frac=sample_frac, random_state=RANDOM_SEED).reset_index(drop=True)
-        print(f"      Sampled   : {df.shape} ({sample_frac*100:.0f}%)")
 
     # ── 2. Drop identifiers & leaky columns ──────────────────
     print("\n[2/6] Dropping identifier and leaky columns...")
@@ -197,7 +198,7 @@ def print_class_distribution(y: np.ndarray, label: str = "Set"):
 # ─────────────────────────────────────────────
 if __name__ == '__main__':
     import sys
-    path = sys.argv[1] if len(sys.argv) > 1 else 'data/paysim.csv'
+    path = sys.argv[1] if len(sys.argv) > 1 else 'D:\PLAKSHA\semester 4\MLPR\Project\sample pipeline\paysim dataset.csv'
     data = load_and_preprocess(path, sample_frac=0.1)
     print(f"\nFeature count : {len(data['feature_names'])}")
     print(f"Feature names : {data['feature_names']}")

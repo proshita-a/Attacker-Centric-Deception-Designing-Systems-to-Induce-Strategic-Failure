@@ -1,6 +1,6 @@
-# Decoy-Based Data Breach Detection System (Honeypot Tech)
+# Canary — Decoy-Based Data Breach Detection System
 
-**Course**: Machine Learning and Pattern Recognition (2nd Year CSAI)  
+**Course**: Machine Learning and Pattern Recognition (2nd Year CS)  
 **Dataset**: PaySim — Synthetic Financial Dataset (Lopez-Rojas, Elmir & Axelsson, EMSS 2016)  
 **Kaggle**: https://www.kaggle.com/datasets/ealaxi/paysim1
 
@@ -8,7 +8,7 @@
 
 ## System Overview
 
-This is a three-layer honeypot system for detecting data exfiltration:
+Canary is a three-layer honeypot system for detecting data exfiltration:
 
 ```
 Layer 0: Preprocessing   → clean, encode, scale, split PaySim

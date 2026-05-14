@@ -82,7 +82,7 @@ def main():
     legit_mask   = y_train == 0
     X_train_legit = X_train[legit_mask]
 
-    n_decoys = args.n_decoys or max(500, int(len(X_train) * 0.10))
+    n_decoys = args.n_decoys or min(3000, max(500, int(len(X_train) * 0.02)))
     print(f"\n  Will generate {n_decoys} decoy records")
 
     # ═══════════════════════════════════════
@@ -158,7 +158,7 @@ def main():
                 'detection_rate' : v['detection_rate'],
                 'decoy_ratio'    : v['decoy_ratio'],
                 'n_trials'       : v.get('n_trials', '-'),
-                'zones_hit'      : str(v.get('zones_hit', {})),
+                'zones_hit'      : str(v.get('zones_hit', {}))
             })
 
     results_df = pd.DataFrame(attack_rows)
