@@ -1,7 +1,7 @@
 """
 preprocessing.py
 ================
-Canary — Decoy-Based Data Breach Detection System
+DecoyNet — Decoy Data Injection for Threat Reduction
 Layer 0: Data Loading and Preprocessing for PaySim dataset
 
 Dataset : PaySim — Synthetic Financial Dataset for Fraud Detection
@@ -97,31 +97,27 @@ def load_and_preprocess(filepath: str,
         scaler                   : fitted StandardScaler
         df_train_raw             : unscaled training DataFrame (for injection layer)
     """
-    print("=" * 60)
-    print("CANARY — Preprocessing Pipeline")
-    print("=" * 60)
+    print("\n[0] Preprocessing")
 
     # ── 1. Load ──────────────────────────────────────────────
-    print(f"\n[1/6] Loading dataset from: {filepath}")
+    print(f"  Loading: {filepath}")
     df = pd.read_csv(filepath)
     # optional dataset sampling for faster experimentation
     if sample_frac < 1.0:
         df = df.sample(frac=sample_frac, random_state=42)
 
-    print(f"      Using sampled dataset: {df.shape}")
-    print(f"      Raw shape : {df.shape}")
-    print(f"      Fraud rate: {df['isFraud'].mean()*100:.4f}%")
+    print(f"  Rows: {len(df):,} | Fraud rate: {df['isFraud'].mean()*100:.4f}%")
 
     # ── 2. Drop identifiers & leaky columns ──────────────────
-    print("\n[2/6] Dropping identifier and leaky columns...")
+    print("  Cleaning identifiers and leakage columns")
     df.drop(columns=DROP_COLS, inplace=True)
 
     # ── 3. Feature engineering ───────────────────────────────
-    print("[3/6] Engineering features...")
+    print("  Engineering transaction features")
     df = _engineer_features(df)
 
     # ── 4. One-hot encode transaction type ───────────────────
-    print("[4/6] Encoding transaction type...")
+    print("  Encoding transaction type")
     # rename spaces to underscores for consistent column names
     df['type'] = df['type'].str.replace('-', '_')
     type_dummies = pd.get_dummies(df['type'], prefix='type')
@@ -133,7 +129,7 @@ def load_and_preprocess(filepath: str,
             df[col] = 0
 
     # ── 5. Train / Val / Test split ──────────────────────────
-    print("[5/6] Splitting into train / val / test sets...")
+    print("  Splitting train / validation / test")
     label_col   = 'isFraud'
     feature_cols = [c for c in df.columns if c != label_col]
 
@@ -149,16 +145,14 @@ def load_and_preprocess(filepath: str,
         X_trainval, y_trainval,
         test_size=val_relative, random_state=RANDOM_SEED, stratify=y_trainval)
 
-    print(f"      Train : {X_train.shape}  | Fraud: {y_train.mean()*100:.3f}%")
-    print(f"      Val   : {X_val.shape}    | Fraud: {y_val.mean()*100:.3f}%")
-    print(f"      Test  : {X_test.shape}   | Fraud: {y_test.mean()*100:.3f}%")
+    print(f"  Train: {len(X_train):,} | Val: {len(X_val):,} | Test: {len(X_test):,}")
 
     # keep unscaled training df for injection layer (needs interpretable values)
     df_train_raw = X_train.copy()
     df_train_raw['isFraud'] = y_train
 
     # ── 6. Normalise ─────────────────────────────────────────
-    print("[6/6] Fitting StandardScaler on training set...")
+    print("  Scaling numeric feature space")
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
     X_val_s   = scaler.transform(X_val)
@@ -168,10 +162,9 @@ def load_and_preprocess(filepath: str,
         os.makedirs(os.path.dirname(scaler_path), exist_ok=True)
         with open(scaler_path, 'wb') as f:
             pickle.dump(scaler, f)
-        print(f"      Scaler saved → {scaler_path}")
+        print(f"  Saved scaler: {scaler_path}")
 
-    print("\n✓ Preprocessing complete.")
-    print("=" * 60)
+    print("  Done.")
 
     return {
         'X_train'      : X_train_s,

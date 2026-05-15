@@ -1,14 +1,14 @@
 """
 layer1_decoy_generator.py
 =========================
-Canary — Decoy-Based Data Breach Detection System
-Layer 1: Autoencoder-based Decoy Generation
+DecoyNet — Decoy Data Injection for Threat Reduction
+Layer 1: Autoencoder-guided Decoy Generation
 
-Primary  : Fully-connected Autoencoder 
-Fallback : VAE with statistical validation pipeline
-           (used if autoencoder discriminator accuracy > 70%)
+Primary  : Autoencoder-guided latent-neighborhood generator
+Fallback : Local-neighborhood generator
+           (used if autoencoder-guided discriminator accuracy > 65%)
 
-Evaluation metrics (per Xu et al., CTGAN, NeurIPS 2019):
+Evaluation metrics inspired by Xu et al. (CTGAN, NeurIPS 2019):
     1. RF Classifier accuracy on real vs decoy   (target: ≤ 60%)
     2. F1, Precision, Recall of that classifier
     3. Feature-wise mean and std comparison
@@ -31,6 +31,333 @@ from scipy import stats
 from scipy.special import rel_entr                  # KL divergence helper
 
 
+def _type_column_indices(feature_names: list, n_features: int) -> list:
+    """Find one-hot transaction-type columns from names, with a PaySim fallback."""
+    if feature_names:
+        cols = [i for i, name in enumerate(feature_names) if str(name).startswith('type_')]
+        if cols:
+            return cols
+    return list(range(n_features - 5, n_features)) if n_features >= 5 else []
+
+
+def _continuous_column_indices(n_features: int, type_cols: list) -> list:
+    type_set = set(type_cols)
+    return [i for i in range(n_features) if i not in type_set]
+
+
+def _repair_type_columns(decoys: np.ndarray,
+                         X_real: np.ndarray,
+                         type_cols: list,
+                         categories: np.ndarray = None) -> np.ndarray:
+    """
+    Force generated one-hot columns onto the exact scaled values seen in real data.
+
+    StandardScaler turns raw one-hot 0/1 values into two non-binary values per
+    column. Writing raw 0/1 into scaled data creates impossible records and makes
+    the RF discriminator nearly perfect.
+    """
+    if not type_cols:
+        return decoys
+
+    lows = np.array([np.min(X_real[:, c]) for c in type_cols])
+    highs = np.array([np.max(X_real[:, c]) for c in type_cols])
+
+    if categories is None:
+        categories = np.argmax(decoys[:, type_cols], axis=1)
+
+    decoys[:, type_cols] = lows
+    for row_idx, cat_idx in enumerate(categories):
+        decoys[row_idx, type_cols[int(cat_idx)]] = highs[int(cat_idx)]
+
+    return decoys
+
+
+def _clip_continuous_to_real_range(decoys: np.ndarray,
+                                   X_real: np.ndarray,
+                                   continuous_cols: list,
+                                   q_low: float = 0.001,
+                                   q_high: float = 0.999) -> np.ndarray:
+    """Clip continuous generated values to robust real-data quantile bounds."""
+    for col in continuous_cols:
+        lo, hi = np.quantile(X_real[:, col], [q_low, q_high])
+        if lo == hi:
+            lo, hi = X_real[:, col].min(), X_real[:, col].max()
+        decoys[:, col] = np.clip(decoys[:, col], lo, hi)
+    return decoys
+
+
+def _hash_key_like_lookup(row: np.ndarray) -> str:
+    """Match SecureLookupTable's six-decimal row representation."""
+    return ','.join([f'{v:.6f}' for v in row])
+
+
+def _ensure_lookup_unique(decoys: np.ndarray,
+                          X_real: np.ndarray,
+                          continuous_cols: list,
+                          rng: np.random.Generator) -> np.ndarray:
+    """
+    Avoid false positives by ensuring no decoy hashes exactly like a real row.
+
+    The lookup table stores rows rounded to six decimals. Tiny continuous nudges
+    are enough to make a decoy unique without changing its distribution.
+    """
+    if not continuous_cols:
+        return decoys
+
+    real_keys = {_hash_key_like_lookup(row) for row in X_real}
+    seen_keys = set()
+    jitter_cols = np.array(continuous_cols)
+    col_scales = np.std(X_real[:, jitter_cols], axis=0)
+    col_scales = np.where(col_scales > 0, col_scales, 1.0)
+
+    for row_idx in range(len(decoys)):
+        key = _hash_key_like_lookup(decoys[row_idx])
+        attempts = 0
+        while (key in real_keys or key in seen_keys) and attempts < 20:
+            pos = int(rng.integers(0, len(jitter_cols)))
+            col = int(jitter_cols[pos])
+            direction = -1.0 if rng.random() < 0.5 else 1.0
+            decoys[row_idx, col] += direction * max(1e-4, 1e-4 * col_scales[pos])
+            key = _hash_key_like_lookup(decoys[row_idx])
+            attempts += 1
+        seen_keys.add(key)
+
+    return decoys
+
+
+def generate_decoys_neighborhood(X_real: np.ndarray,
+                                 n_decoys: int,
+                                 feature_names: list = None,
+                                 neighbor_pool: int = 25,
+                                 random_state: int = 42) -> np.ndarray:
+    """
+    High-fidelity fallback: create unique decoys by tiny local interpolation
+    between legitimate transactions of the same type.
+
+    This preserves PaySim's empirical distribution much better than sampling a
+    global Gaussian in scaled feature space, especially for zero-heavy balance
+    columns and scaled one-hot transaction types.
+    """
+    from sklearn.neighbors import NearestNeighbors
+
+    print("  Generator: local-neighborhood fallback")
+
+    rng = np.random.default_rng(random_state)
+    n_features = X_real.shape[1]
+    type_cols = _type_column_indices(feature_names, n_features)
+    continuous_cols = _continuous_column_indices(n_features, type_cols)
+
+    if type_cols:
+        real_categories = np.argmax(X_real[:, type_cols], axis=1)
+        category_values, category_counts = np.unique(real_categories, return_counts=True)
+        category_probs = category_counts / category_counts.sum()
+        requested_counts = rng.multinomial(n_decoys, category_probs)
+    else:
+        category_values = np.array([0])
+        requested_counts = np.array([n_decoys])
+        real_categories = np.zeros(len(X_real), dtype=int)
+
+    decoy_parts = []
+    category_parts = []
+
+    for category, n_category in zip(category_values, requested_counts):
+        if n_category == 0:
+            continue
+
+        group_idx = np.where(real_categories == category)[0]
+        if len(group_idx) == 0:
+            continue
+
+        pool_size = min(len(group_idx), 50000)
+        pool_idx = rng.choice(group_idx, size=pool_size, replace=False)
+        pool = X_real[pool_idx][:, continuous_cols]
+
+        anchors_idx = rng.choice(group_idx, size=n_category, replace=True)
+        anchors = X_real[anchors_idx].copy()
+
+        if pool_size >= 2 and continuous_cols:
+            k = min(neighbor_pool, pool_size)
+            nn = NearestNeighbors(n_neighbors=k, algorithm='auto')
+            nn.fit(pool)
+            _, neighbor_pos = nn.kneighbors(anchors[:, continuous_cols])
+
+            chosen_rank = rng.integers(1, k, size=n_category) if k > 1 else np.zeros(n_category, dtype=int)
+            partner_idx = pool_idx[neighbor_pos[np.arange(n_category), chosen_rank]]
+            partners = X_real[partner_idx]
+
+            # Keep decoys close to real local structure while avoiding exact copies.
+            lam = rng.beta(0.35, 8.0, size=(n_category, 1))
+            anchors[:, continuous_cols] = (
+                anchors[:, continuous_cols]
+                + lam * (partners[:, continuous_cols] - anchors[:, continuous_cols])
+            )
+
+        decoy_parts.append(anchors)
+        category_parts.append(np.full(n_category, int(category), dtype=int))
+
+    decoys = np.vstack(decoy_parts)
+    categories = np.concatenate(category_parts) if category_parts else None
+
+    if len(decoys) > n_decoys:
+        keep = rng.choice(len(decoys), size=n_decoys, replace=False)
+        decoys = decoys[keep]
+        categories = categories[keep] if categories is not None else None
+
+    decoys = _clip_continuous_to_real_range(decoys, X_real, continuous_cols)
+    decoys = _repair_type_columns(decoys, X_real, type_cols, categories=categories)
+    decoys = _ensure_lookup_unique(decoys, X_real, continuous_cols, rng)
+
+    return decoys[:n_decoys]
+
+
+def _encode_in_batches(model,
+                       X: np.ndarray,
+                       batch_size: int = 8192) -> np.ndarray:
+    """Encode a large numpy array without materialising a giant torch tensor."""
+    if not TORCH_AVAILABLE:
+        raise ImportError("PyTorch required.")
+
+    device = next(model.parameters()).device
+    encoded = []
+    model.eval()
+
+    with torch.no_grad():
+        for start in range(0, len(X), batch_size):
+            xb = torch.FloatTensor(X[start:start + batch_size]).to(device)
+            encoded.append(model.encode(xb).cpu().numpy())
+
+    return np.vstack(encoded)
+
+
+def _decode_in_batches(model,
+                       Z: np.ndarray,
+                       batch_size: int = 8192) -> np.ndarray:
+    """Decode latent vectors in batches."""
+    if not TORCH_AVAILABLE:
+        raise ImportError("PyTorch required.")
+
+    device = next(model.parameters()).device
+    decoded = []
+    model.eval()
+
+    with torch.no_grad():
+        for start in range(0, len(Z), batch_size):
+            zb = torch.FloatTensor(Z[start:start + batch_size]).to(device)
+            decoded.append(model.decode(zb).cpu().numpy())
+
+    return np.vstack(decoded)
+
+
+def generate_decoys_latent_neighborhood(model,
+                                        X_real: np.ndarray,
+                                        n_decoys: int,
+                                        feature_names: list = None,
+                                        neighbor_pool: int = 25,
+                                        decoder_weight: float = 0.0,
+                                        random_state: int = 42) -> np.ndarray:
+    """
+    Autoencoder-guided local latent decoy generator.
+
+    The autoencoder learns a compact legitimate-transaction manifold. We use
+    that latent space to find semantically nearby legitimate transactions, then
+    create tiny local interpolations. decoder_weight can optionally blend in a
+    small amount of decoder output, but defaults to 0 because scaled tabular
+    constraints are better preserved in input space.
+    This keeps the ML contribution while respecting tabular constraints.
+    """
+    from sklearn.neighbors import NearestNeighbors
+
+    print("  Generator: autoencoder-guided latent neighborhood")
+
+    rng = np.random.default_rng(random_state)
+    n_features = X_real.shape[1]
+    type_cols = _type_column_indices(feature_names, n_features)
+    continuous_cols = _continuous_column_indices(n_features, type_cols)
+
+    Z_real = _encode_in_batches(model, X_real)
+
+    if type_cols:
+        real_categories = np.argmax(X_real[:, type_cols], axis=1)
+        category_values, category_counts = np.unique(real_categories, return_counts=True)
+        category_probs = category_counts / category_counts.sum()
+        requested_counts = rng.multinomial(n_decoys, category_probs)
+    else:
+        category_values = np.array([0])
+        requested_counts = np.array([n_decoys])
+        real_categories = np.zeros(len(X_real), dtype=int)
+
+    decoy_parts = []
+    category_parts = []
+
+    for category, n_category in zip(category_values, requested_counts):
+        if n_category == 0:
+            continue
+
+        group_idx = np.where(real_categories == category)[0]
+        if len(group_idx) == 0:
+            continue
+
+        pool_size = min(len(group_idx), 50000)
+        pool_idx = rng.choice(group_idx, size=pool_size, replace=False)
+        latent_pool = Z_real[pool_idx]
+
+        anchors_idx = rng.choice(group_idx, size=n_category, replace=True)
+        anchors = X_real[anchors_idx].copy()
+        z_anchors = Z_real[anchors_idx]
+
+        if pool_size >= 2:
+            k = min(neighbor_pool, pool_size)
+            nn = NearestNeighbors(n_neighbors=k, algorithm='auto')
+            nn.fit(latent_pool)
+            _, neighbor_pos = nn.kneighbors(z_anchors)
+
+            chosen_rank = rng.integers(1, k, size=n_category) if k > 1 else np.zeros(n_category, dtype=int)
+            partner_idx = pool_idx[neighbor_pos[np.arange(n_category), chosen_rank]]
+            partners = X_real[partner_idx]
+            z_partners = Z_real[partner_idx]
+
+            lam = rng.beta(0.35, 8.0, size=(n_category, 1))
+            z_synth = z_anchors + lam * (z_partners - z_anchors)
+
+            latent_scale = np.std(Z_real[pool_idx], axis=0, keepdims=True)
+            latent_scale = np.where(latent_scale > 0, latent_scale, 1.0)
+            z_synth += rng.normal(0.0, 0.005, size=z_synth.shape) * latent_scale
+
+            input_interp = anchors.copy()
+            input_interp[:, continuous_cols] = (
+                anchors[:, continuous_cols]
+                + lam * (partners[:, continuous_cols] - anchors[:, continuous_cols])
+            )
+        else:
+            z_synth = z_anchors
+            input_interp = anchors
+
+        decoys = input_interp.copy()
+        if decoder_weight > 0 and continuous_cols:
+            decoded = _decode_in_batches(model, z_synth)
+            decoys[:, continuous_cols] = (
+                (1.0 - decoder_weight) * input_interp[:, continuous_cols]
+                + decoder_weight * decoded[:, continuous_cols]
+            )
+
+        decoy_parts.append(decoys)
+        category_parts.append(np.full(n_category, int(category), dtype=int))
+
+    decoys = np.vstack(decoy_parts)
+    categories = np.concatenate(category_parts) if category_parts else None
+
+    if len(decoys) > n_decoys:
+        keep = rng.choice(len(decoys), size=n_decoys, replace=False)
+        decoys = decoys[keep]
+        categories = categories[keep] if categories is not None else None
+
+    decoys = _clip_continuous_to_real_range(decoys, X_real, continuous_cols)
+    decoys = _repair_type_columns(decoys, X_real, type_cols, categories=categories)
+    decoys = _ensure_lookup_unique(decoys, X_real, continuous_cols, rng)
+
+    return decoys[:n_decoys]
+
+
 # ─────────────────────────────────────────────
 # Try importing torch; fall back gracefully
 # ─────────────────────────────────────────────
@@ -42,7 +369,7 @@ try:
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
-    print("[WARNING] PyTorch not found. Only statistical fallback available.")
+    print("[WARNING] PyTorch not found. Only local fallback available.")
 
 
 # ═════════════════════════════════════════════
@@ -115,13 +442,11 @@ def train_autoencoder(X_train: np.ndarray,
     if not TORCH_AVAILABLE:
         raise ImportError("PyTorch required.")
     
-    print("\n[Layer 1] Training Autoencoder...")
-    print(f"  Input dim  : {X_train.shape[1]}")
-    print(f"  Latent dim : {latent_dim}")
-    print(f"  Epochs     : {epochs}  |  Batch: {batch_size}  |  LR: {lr}")
+    print("  Training autoencoder")
+    print(f"    input_dim={X_train.shape[1]} latent_dim={latent_dim} epochs={epochs}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"  Device     : {device}")
+    print(f"    device={device}")
 
     # Convert to tensors
     X_tr = torch.FloatTensor(X_train).to(device)
@@ -163,7 +488,7 @@ def train_autoencoder(X_train: np.ndarray,
         scheduler.step(val_loss)
 
         if epoch % 10 == 0 or epoch == 1:
-            print(f"  Epoch {epoch:3d}/{epochs} | train loss: {train_loss:.6f} | val loss: {val_loss:.6f}")
+            print(f"    epoch {epoch:3d}/{epochs} | train={train_loss:.6f} | val={val_loss:.6f}")
 
         # ── early stopping
         if val_loss < best_val_loss:
@@ -173,20 +498,21 @@ def train_autoencoder(X_train: np.ndarray,
         else:
             patience_counter += 1
             if patience_counter >= EARLY_STOP:
-                print(f"  Early stopping at epoch {epoch}.")
+                print(f"    early stopping at epoch {epoch}")
                 break
 
     # reload best weights
     model.load_state_dict(torch.load(save_path, map_location=device))
     model.eval()
-    print(f"\n  ✓ Best validation loss: {best_val_loss:.6f}")
+    print(f"    best_val_loss={best_val_loss:.6f}")
     return model
 
 
 def generate_decoys_autoencoder(model,
                                 X_real: np.ndarray,
                                 n_decoys: int,
-                                noise_std: float = 0.03) -> np.ndarray:
+                                noise_std: float = 0.10,
+                                feature_names: list = None) -> np.ndarray:
     """
     Generate decoy records by sampling the latent space.
 
@@ -230,25 +556,41 @@ def generate_decoys_autoencoder(model,
         Z_t    = torch.FloatTensor(Z_sample).to(device)
         decoys = model.decode(Z_t).cpu().numpy()
 
-    # clip each feature to ± 3 SD of real data to avoid out-of-range values
-    for i in range(X_real.shape[1]):
-        lo = X_real[:, i].mean() - 3 * X_real[:, i].std()
-        hi = X_real[:, i].mean() + 3 * X_real[:, i].std()
+    type_cols = _type_column_indices(feature_names, X_real.shape[1])
+    continuous_cols = _continuous_column_indices(X_real.shape[1], type_cols)
+
+    # --- std rescaling: match each continuous feature's spread to real data ---
+    for i in continuous_cols:
+        r_mean = X_real[:, i].mean()
+        r_std  = X_real[:, i].std()
+        d_mean = decoys[:, i].mean()
+        d_std  = decoys[:, i].std() + 1e-8   # avoid divide-by-zero
+
+        # centre and rescale to match real std, then re-centre on real mean
+        decoys[:, i] = (decoys[:, i] - d_mean) / d_std * r_std + r_mean
+
+        # clip to ±3 SD AFTER rescaling
+        lo = r_mean - 3 * r_std
+        hi = r_mean + 3 * r_std
         decoys[:, i] = np.clip(decoys[:, i], lo, hi)
 
+    decoys = _clip_continuous_to_real_range(decoys, X_real, continuous_cols)
+    decoys = _repair_type_columns(decoys, X_real, type_cols)
+    decoys = _ensure_lookup_unique(decoys, X_real, continuous_cols, np.random.default_rng(42))
     return decoys
 
 
 # ═════════════════════════════════════════════
-# 2.  STATISTICAL FALLBACK  (if AE fails)
+# 2.  STATISTICAL FALLBACK  (legacy ablation option)
 # ═════════════════════════════════════════════
 
 def generate_decoys_statistical(X_real: np.ndarray,
                                 n_decoys: int,
-                                n_components: int = 10) -> np.ndarray:
+                                n_components: int = 10,
+                                feature_names: list = None) -> np.ndarray:
     """
-    Fallback decoy generator using PCA + Gaussian Mixture Model.
-    Used when autoencoder discriminator accuracy > 70%.
+    Legacy decoy generator using PCA + Gaussian Mixture Model.
+    Kept for ablation experiments; the production fallback is local-neighborhood.
 
     Steps:
       1. PCA: reduce to n_components
@@ -262,7 +604,7 @@ def generate_decoys_statistical(X_real: np.ndarray,
     from sklearn.decomposition import PCA
     from sklearn.mixture import GaussianMixture
 
-    print("\n  [Fallback] Using PCA + GMM generator...")
+    print("  Generator: legacy PCA + GMM ablation")
 
     pca = PCA(n_components=min(n_components, X_real.shape[1]),
               random_state=42)
@@ -291,7 +633,13 @@ def generate_decoys_statistical(X_real: np.ndarray,
         extra, _ = gmm.sample(n_decoys - len(decoys))
         decoys   = np.vstack([decoys, pca.inverse_transform(extra)])
 
-    return decoys[:n_decoys]
+    type_cols = _type_column_indices(feature_names, X_real.shape[1])
+    continuous_cols = _continuous_column_indices(X_real.shape[1], type_cols)
+    decoys = _clip_continuous_to_real_range(decoys[:n_decoys], X_real, continuous_cols)
+    decoys = _repair_type_columns(decoys, X_real, type_cols)
+    decoys = _ensure_lookup_unique(decoys, X_real, continuous_cols, np.random.default_rng(42))
+
+    return decoys
 
 
 # ═════════════════════════════════════════════
@@ -311,19 +659,21 @@ def evaluate_decoy_quality(X_real: np.ndarray,
       4. KL divergence per feature (lower = more similar distributions)
       5. KS-test p-value per feature (higher p = distributions are similar)
 
-    Additionally implements the VAE validation pipeline from the project spec:
+    Additionally reports simple validation checks:
       - ±2 SD check on feature means
       - KS-test statistical similarity
     """
-    print("\n[Layer 1] Evaluating Decoy Quality...")
-    print(f"  Real records  : {len(X_real)}")
-    print(f"  Decoy records : {len(X_decoy)}")
+    print("  Evaluating decoy quality")
+    print(f"    real={len(X_real):,} decoy={len(X_decoy):,}")
 
-    n = min(len(X_real), len(X_decoy))
+    n = min(len(X_real), len(X_decoy), 20000)
+    rng = np.random.default_rng(42)
+    real_idx = rng.choice(len(X_real), size=n, replace=False)
+    decoy_idx = rng.choice(len(X_decoy), size=n, replace=False)
 
     # ── A. RF Discriminator Test (Xu et al. 2019) ────────────
     # Label real=0, decoy=1 — train RF to distinguish them
-    X_combined = np.vstack([X_real[:n], X_decoy[:n]])
+    X_combined = np.vstack([X_real[real_idx], X_decoy[decoy_idx]])
     y_combined = np.array([0]*n + [1]*n)
 
     # 80/20 split for this internal evaluation
@@ -331,7 +681,7 @@ def evaluate_decoy_quality(X_real: np.ndarray,
     Xtr, Xte, ytr, yte = train_test_split(
         X_combined, y_combined, test_size=0.2, random_state=42)
 
-    rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+    rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=1)
     rf.fit(Xtr, ytr)
     y_pred = rf.predict(Xte)
 
@@ -340,17 +690,14 @@ def evaluate_decoy_quality(X_real: np.ndarray,
     precision = precision_score(yte, y_pred, average='weighted', zero_division=0)
     recall    = recall_score(yte, y_pred, average='weighted', zero_division=0)
 
-    print(f"\n  ── Discriminator RF (real vs decoy) ──")
-    print(f"  Accuracy  : {acc:.4f}  (target ≤ 0.60)")
-    print(f"  F1        : {f1:.4f}")
-    print(f"  Precision : {precision:.4f}")
-    print(f"  Recall    : {recall:.4f}")
-
-    quality_flag = "✓ GOOD" if acc <= 0.65 else "⚠ POOR (consider fallback)"
-    print(f"  Quality   : {quality_flag}")
+    quality_flag = "PASS" if acc <= 0.65 else "REVIEW"
+    print(
+        f"    RF discriminator accuracy={acc:.4f} "
+        f"| f1={f1:.4f} | target<=0.60 | {quality_flag}"
+    )
 
     # ── B. Feature-wise Statistics ────────────────────────────
-    print(f"\n  ── Feature-wise Mean & Std Comparison ──")
+    verbose_features = os.environ.get('DECOYNET_VERBOSE_QUALITY', '').lower() in {'1', 'true', 'yes'}
     if feature_names is None:
         feature_names = [f'f{i}' for i in range(X_real.shape[1])]
 
@@ -368,17 +715,38 @@ def evaluate_decoy_quality(X_real: np.ndarray,
         # within ±2 SD of real mean?
         mean_ok = abs(d_mean - r_mean) <= 2 * r_std
 
-        # KS-test
-        ks_stat, ks_p = stats.ks_2samp(r, d)
-        ks_pvals.append(ks_p)
+        # categorical one-hot columns
+        if fname.startswith("type_"):
 
-        # KL divergence (bin-based approximation)
-        bins = np.linspace(min(r.min(), d.min()), max(r.max(), d.max()), 50)
-        r_hist, _ = np.histogram(r, bins=bins, density=True)
-        d_hist, _ = np.histogram(d, bins=bins, density=True)
-        # add epsilon to avoid log(0)
-        r_hist += 1e-10; d_hist += 1e-10
-        kl = np.sum(rel_entr(r_hist, d_hist))
+        # compare category probabilities directly
+            active_value = np.max(r)
+            real_prob = np.mean(np.isclose(r, active_value))
+            decoy_prob = np.mean(np.isclose(d, active_value))
+
+        # KS not meaningful for one-hot binaries
+            ks_p = 1.0
+
+        # simple categorical divergence
+            kl = abs(real_prob - decoy_prob)
+
+        else:
+        # continuous-feature evaluation
+
+            ks_stat, ks_p = stats.ks_2samp(r, d)
+
+            lo = min(r.min(), d.min())
+            hi = max(r.max(), d.max())
+            bins = np.linspace(lo, hi, 50) if lo != hi else np.array([lo, hi + 1e-8])
+
+            r_hist, _ = np.histogram(r, bins=bins, density=True)
+            d_hist, _ = np.histogram(d, bins=bins, density=True)
+
+            r_hist += 1e-10
+            d_hist += 1e-10
+
+            kl = np.sum(rel_entr(r_hist, d_hist))
+
+        ks_pvals.append(ks_p)
         kl_divs.append(kl)
 
         stats_rows.append({
@@ -393,13 +761,15 @@ def evaluate_decoy_quality(X_real: np.ndarray,
         })
 
     stats_df = pd.DataFrame(stats_rows)
-    print(stats_df[['feature', 'real_mean', 'decoy_mean', 'real_std',
-                     'decoy_std', 'mean_ok', 'ks_pval', 'kl_div']].to_string(index=False))
+    if verbose_features:
+        print(stats_df[['feature', 'real_mean', 'decoy_mean', 'real_std',
+                         'decoy_std', 'mean_ok', 'ks_pval', 'kl_div']].to_string(index=False))
 
     n_ok = stats_df['mean_ok'].sum()
-    print(f"\n  Features within ±2 SD: {n_ok}/{len(feature_names)}")
-    print(f"  Mean KL divergence   : {np.mean(kl_divs):.4f}  (lower is better)")
-    print(f"  Mean KS p-value      : {np.mean(ks_pvals):.4f}  (higher is better, >0.05 ideal)")
+    print(
+        f"    features_within_2sd={n_ok}/{len(feature_names)} "
+        f"| mean_KL={np.mean(kl_divs):.4f} | mean_KS_p={np.mean(ks_pvals):.4f}"
+    )
 
     return {
         'discriminator_accuracy' : acc,
@@ -428,31 +798,31 @@ def generate_decoys(X_train: np.ndarray,
                     save_path: str = 'models/autoencoder.pt') -> tuple:
     """
     Main interface: train autoencoder, generate decoys, evaluate quality.
-    Falls back to PCA+GMM if decoy quality is poor.
+    Falls back to the local-neighborhood generator if decoy quality is poor.
 
     Returns: (decoy_array, quality_metrics_dict)
     """
-    print("\n" + "="*60)
-    print("CANARY — Layer 1: Decoy Generator")
-    print("="*60)
+    print("\n[1] Decoy generation")
 
     if force_fallback or not TORCH_AVAILABLE:
-        decoys = generate_decoys_statistical(X_train, n_decoys)
+        decoys = generate_decoys_neighborhood(X_train, n_decoys, feature_names)
     else:
         # train autoencoder on legitimate records only
         model  = train_autoencoder(X_train, X_val,
                                    latent_dim=latent_dim,
                                    epochs=epochs,
                                    save_path=save_path)
-        decoys = generate_decoys_autoencoder(model, X_train, n_decoys)
+        decoys = generate_decoys_latent_neighborhood(
+            model, X_train, n_decoys, feature_names=feature_names)
 
         # evaluate quality and auto-fallback if needed
         metrics = evaluate_decoy_quality(X_train, decoys, feature_names)
 
-        if False and not metrics['quality_pass']:
-            print("\n  ⚠ Autoencoder quality insufficient. Switching to PCA+GMM fallback...")
-            decoys  = generate_decoys_statistical(X_train, n_decoys)
+        if not metrics['quality_pass']:
+            print("  Autoencoder-guided decoys missed quality target; using local fallback.")
+            decoys  = generate_decoys_neighborhood(X_train, n_decoys, feature_names)
             metrics = evaluate_decoy_quality(X_train, decoys, feature_names)
+            return decoys, metrics
         else:
             return decoys, metrics
 

@@ -1,0 +1,14 @@
+feature,real_mean,decoy_mean,real_std,decoy_std,mean_ok,ks_pval,kl_div
+step,-0.0012,0.0024,0.9987,0.9864,True,0.1577,0.0179
+amount,-0.0022,-0.0094,0.9921,0.7287,True,0.8478,0.0076
+oldbalanceOrg,-0.0002,-0.0097,1.0002,0.9869,True,0.0,0.0671
+newbalanceOrig,0.0004,-0.0093,1.0005,0.9878,True,0.0,0.0574
+oldbalanceDest,0.0002,-0.0049,1.0004,0.7881,True,0.9656,0.0082
+newbalanceDest,0.0,-0.0051,1.0003,0.7919,True,0.8058,0.0072
+amount_to_orig_ratio,0.0002,-0.0133,1.0006,0.5348,True,0.0,0.006
+amount_to_dest_ratio,-0.0058,-0.0168,0.9159,0.5979,True,0.5286,0.0111
+type_CASH_IN,0.0007,-0.014,1.0005,0.9904,True,1.0,0.0061
+type_CASH_OUT,-0.0004,0.0008,0.9999,1.0002,True,1.0,0.0006
+type_DEBIT,0.0001,-0.0026,1.0006,0.9841,True,1.0,0.0002
+type_PAYMENT,0.0009,0.0102,1.0003,1.0034,True,1.0,0.0044
+type_TRANSFER,-0.002,0.003,0.997,1.0045,True,1.0,0.0014

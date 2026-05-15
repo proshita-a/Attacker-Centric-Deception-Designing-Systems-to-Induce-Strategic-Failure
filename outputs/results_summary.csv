@@ -1,0 +1,8 @@
+attack,detection_rate,decoy_ratio,n_trials,zones_hit
+bulk_steal_30,1.0,0.04997653683716566,10,"{'random': 10712, 'high_value': 8788, 'edge_case': 8735, 'cluster': 6910}"
+bulk_steal_10,1.0,0.04985282197858453,10,"{'edge_case': 2904, 'high_value': 2883, 'random': 3544, 'cluster': 2355}"
+targeted_top20,1.0,0.05560650982232366,10,"{'high_value': 17340, 'random': 6580, 'cluster': 2110, 'edge_case': 40}"
+targeted_top10,1.0,0.05195802405938059,10,"{'high_value': 8500, 'random': 3360, 'cluster': 310, 'edge_case': 10}"
+mimicry_5pct,1.0,0.05126558594159295,10,"{'edge_case': 8830, 'cluster': 6880, 'high_value': 8403, 'random': 10136}"
+mimicry_10pct,1.0,0.05106729234804316,10,"{'edge_case': 8650, 'cluster': 6717, 'high_value': 7507, 'random': 9447}"
+slow_theft,1.0,0.0474,10,"{'high_value': 262, 'cluster': 179, 'random': 279, 'edge_case': 228}"

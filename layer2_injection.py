@@ -1,7 +1,7 @@
 """
 layer2_injection.py
 ===================
-Canary — Decoy-Based Data Breach Detection System
+DecoyNet — Decoy Data Injection for Threat Reduction
 Layer 2: Decoy Injection + Cryptographically Secured Lookup Table
 
 Four injection strategies:
@@ -122,8 +122,8 @@ class SecureLookupTable:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'w') as f:
             json.dump(self._table, f)
-        print(f"  Lookup table saved → {path}")
-        print(f"  ⚠ Salt NOT saved to file (keep separately): {self.salt[:16]}...")
+        print(f"  Saved lookup table: {path}")
+        print("  Salt is stored separately.")
 
     @classmethod
     def load(cls, path: str, salt: str) -> 'SecureLookupTable':
@@ -173,7 +173,7 @@ def _strategy_edge_case(X_real: np.ndarray,
         # Can't find boundary without both classes; fall back to random
         return _strategy_random(X_real, decoys, n_inject)
 
-    rf = RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=-1)
+    rf = RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=1)
     rf.fit(X_real, y_real)
     probs = rf.predict_proba(X_real)[:, 1]
 
@@ -293,9 +293,7 @@ def inject_decoys(X_real: np.ndarray,
     zone_labels : zone string per record ('' for real records)
     lookup      : SecureLookupTable instance
     """
-    print("\n" + "="*60)
-    print("CANARY — Layer 2: Decoy Injection")
-    print("="*60)
+    print("\n[2] Decoy injection")
 
     if strategy_weights is None:
         strategy_weights = {
@@ -308,14 +306,18 @@ def inject_decoys(X_real: np.ndarray,
     # total number of decoys to inject
     n_total_decoys = int(len(X_real) * injection_ratio / (1 - injection_ratio))
     n_total_decoys = min(n_total_decoys, len(decoys))
+    if n_total_decoys < int(len(X_real) * injection_ratio / (1 - injection_ratio)):
+        actual_ratio = n_total_decoys / (len(X_real) + n_total_decoys)
+        print(
+            f"  Requested {injection_ratio*100:.1f}% injection, "
+            f"but supplied decoys allow {actual_ratio*100:.2f}%."
+        )
 
-    print(f"\n  Real records       : {len(X_real)}")
-    print(f"  Injection ratio    : {injection_ratio*100:.1f}%")
-    print(f"  Decoys to inject   : {n_total_decoys}")
-    print(f"  Strategy weights   : {strategy_weights}")
+    print(f"  real={len(X_real):,} decoys_to_inject={n_total_decoys:,}")
 
     lookup = SecureLookupTable(salt=salt)
 
+    seen_hashes = set()
     injected_decoys = []
     zone_tags       = []
 
@@ -323,22 +325,52 @@ def inject_decoys(X_real: np.ndarray,
         n_zone = max(1, int(n_total_decoys * weight))
 
         if zone == 'random':
-            batch = _strategy_random(X_real, decoys, n_zone)
+            batch = _strategy_random(X_real, decoys, n_zone * 2)  # oversample
         elif zone == 'edge_case':
-            batch = _strategy_edge_case(X_real, y_real, decoys, n_zone)
+            batch = _strategy_edge_case(X_real, y_real, decoys, n_zone * 2)
         elif zone == 'cluster':
-            batch = _strategy_cluster(X_real, decoys, n_zone)
+            batch = _strategy_cluster(X_real, decoys, n_zone * 2)
         elif zone == 'high_value':
-            batch = _strategy_high_value(X_real, decoys, n_zone)
+            batch = _strategy_high_value(X_real, decoys, n_zone * 2)
         else:
-            batch = _strategy_random(X_real, decoys, n_zone)
+            batch = _strategy_random(X_real, decoys, n_zone * 2)
 
-        # register in lookup table
+        # filter out rows already used by a previous strategy
+        unique_rows = []
+        for row in batch:
+            row_key = lookup._hash_record(row)
+            if row_key not in seen_hashes:
+                seen_hashes.add(row_key)
+                unique_rows.append(row)
+            if len(unique_rows) == n_zone:
+                break
+
+        batch = np.array(unique_rows) if unique_rows else batch[:1]
+
         lookup.register(batch, zone)
         injected_decoys.append(batch)
         zone_tags.extend([zone] * len(batch))
 
-        print(f"  ✓ {zone:<12}: {len(batch)} decoys injected")
+        print(f"    {zone:<10} {len(batch):,}")
+
+    current_total = sum(len(batch) for batch in injected_decoys)
+    shortfall = n_total_decoys - current_total
+    if shortfall > 0:
+        backfill = []
+        for row in decoys[np.random.permutation(len(decoys))]:
+            row_key = lookup._hash_record(row)
+            if row_key not in seen_hashes:
+                seen_hashes.add(row_key)
+                backfill.append(row)
+            if len(backfill) == shortfall:
+                break
+
+        if backfill:
+            batch = np.array(backfill)
+            lookup.register(batch, 'random')
+            injected_decoys.append(batch)
+            zone_tags.extend(['random'] * len(batch))
+            print(f"    backfill   {len(batch):,}")
 
     all_decoys = np.vstack(injected_decoys)
 
@@ -358,12 +390,10 @@ def inject_decoys(X_real: np.ndarray,
 
     lookup.summary()
 
-    print(f"\n  Final injected dataset:")
-    print(f"    Total records  : {len(X_injected)}")
-    print(f"    Real records   : {len(X_real)}")
-    print(f"    Decoy records  : {len(all_decoys)}")
-    print(f"    Actual decoy % : {len(all_decoys)/len(X_injected)*100:.2f}%")
-    print("\n  ✓ Injection complete.")
+    print(
+        f"  final_total={len(X_injected):,} real={len(X_real):,} "
+        f"decoy={len(all_decoys):,} actual_decoy_pct={len(all_decoys)/len(X_injected)*100:.2f}%"
+    )
 
     return X_injected, y_injected, is_decoy, zone_labels, lookup
 
@@ -392,8 +422,7 @@ def injection_density_experiment(X_real: np.ndarray,
         })
 
     df = pd.DataFrame(rows)
-    print("\n  ── Injection Density Options ──")
-    print(df.to_string(index=False))
+    print("  Injection density options computed.")
     return df
 
 

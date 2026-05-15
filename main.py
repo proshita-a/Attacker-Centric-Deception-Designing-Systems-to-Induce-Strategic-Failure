@@ -1,13 +1,13 @@
 """
 main.py
 =======
-Canary — Decoy-Based Data Breach Detection System
+DecoyNet — Decoy Data Injection for Threat Reduction
 Main pipeline: runs all three layers end-to-end.
 
 Usage:
     python main.py --data path/to/paysim.csv
     python main.py --data path/to/paysim.csv --sample 0.1   # quick test with 10% data
-    python main.py --data path/to/paysim.csv --fallback      # skip autoencoder, use PCA+GMM
+    python main.py --data path/to/paysim.csv --fallback      # skip autoencoder, use local fallback
 
 Output:
     outputs/results_summary.csv    — attack simulation results table
@@ -30,7 +30,7 @@ from layer3_detection     import run_full_detection_experiment
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Canary: Decoy-Based Breach Detection')
+    parser = argparse.ArgumentParser(description='DecoyNet: Decoy Data Injection for Threat Reduction')
     parser.add_argument('--data',       type=str,   required=True,
                         help='Path to PaySim CSV file')
     parser.add_argument('--sample',     type=float, default=1.0,
@@ -42,9 +42,9 @@ def parse_args():
     parser.add_argument('--epochs',     type=int,   default=50,
                         help='Autoencoder training epochs (default: 50)')
     parser.add_argument('--n_decoys',   type=int,   default=None,
-                        help='Number of decoys to generate (default: 10%% of training set)')
+                        help='Number of decoys to generate (default: enough for target injection ratio)')
     parser.add_argument('--fallback',   action='store_true',
-                        help='Skip autoencoder, use PCA+GMM fallback')
+                        help='Skip autoencoder, use local-neighborhood fallback')
     parser.add_argument('--trials',     type=int,   default=20,
                         help='Attack simulation trials per attack type (default: 20)')
     return parser.parse_args()
@@ -55,10 +55,13 @@ def main():
     os.makedirs('models',  exist_ok=True)
     os.makedirs('outputs', exist_ok=True)
 
-    print("\n" + "█"*60)
-    print("  CANARY — Decoy-Based Data Breach Detection System")
-    print("  Dataset: PaySim (Lopez-Rojas et al., EMSS 2016)")
-    print("█"*60)
+    print("\n" + "="*72)
+    print("DecoyNet: Decoy Data Injection for Threat Reduction")
+    print("="*72)
+    print(f"Dataset        : {args.data}")
+    print(f"Sample fraction: {args.sample:.2f}")
+    print(f"Injection ratio: {args.inject*100:.1f}%")
+    print(f"Trials/attack  : {args.trials}")
 
     # ═══════════════════════════════════════
     # LAYER 0: Preprocessing
@@ -82,8 +85,10 @@ def main():
     legit_mask   = y_train == 0
     X_train_legit = X_train[legit_mask]
 
-    n_decoys = args.n_decoys or min(3000, max(500, int(len(X_train) * 0.02)))
-    print(f"\n  Will generate {n_decoys} decoy records")
+    # Generate enough decoys to satisfy the injection ratio
+    n_needed = int(len(X_train) * args.inject / (1 - args.inject))
+    n_decoys = args.n_decoys or max(n_needed, 500)
+    print(f"\nDecoys requested: {n_decoys} (needed for target ratio: {n_needed})")
 
     # ═══════════════════════════════════════
     # LAYER 1: Decoy Generation
@@ -103,7 +108,7 @@ def main():
     quality_df = quality_metrics.get('stats_df', pd.DataFrame())
     if not quality_df.empty:
         quality_df.to_csv('outputs/decoy_quality.csv', index=False)
-        print(f"\n  Decoy quality report → outputs/decoy_quality.csv")
+        print("Saved decoy quality details: outputs/decoy_quality.csv")
 
     # ═══════════════════════════════════════
     # LAYER 2: Injection
@@ -124,7 +129,7 @@ def main():
     # save salt separately (in real system this goes to a secrets manager)
     with open('models/KEEP_SECRET_salt.txt', 'w') as f:
         f.write(lookup.salt)
-    print("  Salt saved → models/KEEP_SECRET_salt.txt  (keep this secret!)")
+    print("Saved lookup table and salt under models/.")
 
     # ═══════════════════════════════════════
     # LAYER 3: Detection + Baselines
@@ -146,8 +151,7 @@ def main():
     # ═══════════════════════════════════════
     # SAVE RESULTS
     # ═══════════════════════════════════════
-    print("\n" + "="*60)
-    print("Saving results...")
+    print("\nSaving result files...")
 
     # attack summary table
     attack_rows = []
@@ -177,14 +181,12 @@ def main():
     with open('outputs/quality_summary.json', 'w') as f:
         json.dump(quality_summary, f, indent=2)
 
-    print("\n  outputs/results_summary.csv    — attack simulation results")
-    print("  outputs/baseline_comparison.csv — RF vs IsolationForest baselines")
-    print("  outputs/quality_summary.json    — decoy quality metrics")
-    print("  outputs/decoy_quality.csv       — per-feature quality report")
+    print("  outputs/results_summary.csv")
+    print("  outputs/baseline_comparison.csv")
+    print("  outputs/quality_summary.json")
+    print("  outputs/decoy_quality.csv")
 
-    print("\n" + "█"*60)
-    print("  CANARY — Pipeline complete.")
-    print("█"*60 + "\n")
+    print("\nDecoyNet run complete.\n")
 
     return results
 

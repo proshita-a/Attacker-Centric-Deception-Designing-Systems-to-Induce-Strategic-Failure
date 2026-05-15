@@ -1,7 +1,7 @@
 """
 layer3_detection.py
 ===================
-Canary — Decoy-Based Data Breach Detection System
+DecoyNet — Decoy Data Injection for Threat Reduction
 Layer 3: Attack Simulation + Detection + Flood Response
 
 Attack types simulated:
@@ -18,7 +18,7 @@ Detection:
 Baselines compared:
   Baseline 1: Random Forest fraud detector (proves decoys don't corrupt model)
   Baseline 2: Isolation Forest anomaly detector (shows traditional methods
-              miss slow theft / insider threats — your system catches them)
+              miss slow theft / insider threats that DecoyNet catches)
 """
 
 import numpy as np
@@ -110,7 +110,7 @@ class AttackSimulator:
         contamination: fraction attacker believes are 'anomalous' / decoys.
         """
         # attacker trains their own outlier detector
-        iso = IsolationForest(contamination=contamination, random_state=42, n_jobs=-1)
+        iso = IsolationForest(contamination=contamination, random_state=42, n_jobs=1)
         iso.fit(self.X)
         labels = iso.predict(self.X)     # -1 = outlier (attacker discards these)
 
@@ -139,7 +139,7 @@ class AttackSimulator:
 
         This is where traditional anomaly detectors fail completely —
         each individual batch looks innocuous.
-        Canary catches it because even one decoy in any batch triggers alarm.
+        DecoyNet catches it because even one decoy in any batch triggers alarm.
 
         Returns per-batch results and overall detection summary.
         """
@@ -230,9 +230,10 @@ def flood_response(X_injected: np.ndarray,
     flooded = np.vstack([all_decoys[decoy_idx], X_injected[real_idx]])
     np.random.shuffle(flooded)
 
-    print(f"\n  🚨 ALARM — Flood response activated")
-    print(f"     Returning {len(flooded)} records: {n_decoy_return} decoy + {n_real_return} real")
-    print(f"     Attacker data is {decoy_fraction*100:.0f}% useless")
+    print(
+        f"\n  Flood response activated: returned={len(flooded)} "
+        f"decoy={n_decoy_return} real={n_real_return}"
+    )
 
     return flooded
 
@@ -252,7 +253,7 @@ def baseline_random_forest(X_train: np.ndarray, y_train: np.ndarray,
     Reference: Lopez-Rojas et al. (2016) PaySim paper baseline.
     """
     rf = RandomForestClassifier(n_estimators=100, random_state=42,
-                                class_weight='balanced', n_jobs=-1)
+                                class_weight='balanced', n_jobs=1)
     rf.fit(X_train, y_train)
     y_pred  = rf.predict(X_test)
     y_proba = rf.predict_proba(X_test)[:, 1]
@@ -266,12 +267,10 @@ def baseline_random_forest(X_train: np.ndarray, y_train: np.ndarray,
         'recall'   : recall_score(y_test, y_pred, zero_division=0),
     }
 
-    print(f"\n  ── {label} ──")
-    print(f"  AUC-ROC  : {metrics['auc_roc']:.4f}")
-    print(f"  AUC-PR   : {metrics['auc_pr']:.4f}")
-    print(f"  F1       : {metrics['f1']:.4f}")
-    print(f"  Precision: {metrics['precision']:.4f}")
-    print(f"  Recall   : {metrics['recall']:.4f}")
+    print(
+        f"  {label}: AUC-ROC={metrics['auc_roc']:.4f} "
+        f"AUC-PR={metrics['auc_pr']:.4f} F1={metrics['f1']:.4f}"
+    )
 
     return metrics
 
@@ -284,12 +283,12 @@ def baseline_isolation_forest(X_train: np.ndarray,
     Baseline 2: Isolation Forest anomaly detector.
     Purpose: demonstrate that traditional anomaly detection MISSES
              slow/incremental theft and targeted attacks.
-    Canary catches these cases; Isolation Forest does not.
+    DecoyNet catches these cases; Isolation Forest does not.
 
-    This is your key competitive advantage in the paper.
+    This is DecoyNet's key advantage over pure anomaly detection.
     """
-    iso = IsolationForest(contamination=0.035,   # ~3.5% fraud in PaySim
-                          random_state=42, n_jobs=-1)
+    fraud_rate = max(y_test.mean(), 0.001)   # actual rate from test set
+    iso = IsolationForest(contamination=fraud_rate, random_state=42, n_jobs=1)
     iso.fit(X_train)
 
     # IsolationForest: -1 = anomaly, 1 = normal
@@ -306,14 +305,10 @@ def baseline_isolation_forest(X_train: np.ndarray,
         'recall'   : recall_score(y_test, y_pred, zero_division=0),
     }
 
-    print(f"\n  ── {label} ──")
-    print(f"  AUC-ROC  : {metrics['auc_roc']:.4f}")
-    print(f"  AUC-PR   : {metrics['auc_pr']:.4f}")
-    print(f"  F1       : {metrics['f1']:.4f}")
-    print(f"  Precision: {metrics['precision']:.4f}")
-    print(f"  Recall   : {metrics['recall']:.4f}")
-    print(f"  NOTE: This baseline does NOT detect slow theft or targeted attacks.")
-    print(f"        Canary catches those — see attack simulation results.")
+    print(
+        f"  {label}: AUC-ROC={metrics['auc_roc']:.4f} "
+        f"AUC-PR={metrics['auc_pr']:.4f} F1={metrics['f1']:.4f}"
+    )
 
     return metrics
 
@@ -338,15 +333,13 @@ def run_full_detection_experiment(X_injected: np.ndarray,
     n_trials: number of times each probabilistic attack is repeated
               (results are averaged for stability).
     """
-    print("\n" + "="*60)
-    print("CANARY — Layer 3: Detection & Attack Simulation")
-    print("="*60)
+    print("\n[3] Attack simulation and baselines")
 
     sim     = AttackSimulator(X_injected, y_injected, is_decoy, zone_labels, lookup)
     results = {}
 
     # ── Attacks ───────────────────────────────────────────────
-    print("\n[A] Running attack simulations...")
+    print("  Attack simulations")
 
     attack_configs = [
         ('bulk_steal_30',  lambda: sim.bulk_steal(steal_fraction=0.30)),
@@ -377,13 +370,13 @@ def run_full_detection_experiment(X_injected: np.ndarray,
             'n_trials'       : n_trials,
         }
 
-        print(f"\n  {name}:")
-        print(f"    Detection rate : {detection_rate*100:.1f}%")
-        print(f"    Avg decoy ratio: {avg_decoy_ratio*100:.2f}% of stolen data")
-        print(f"    Zones hit      : {zone_agg}")
+        print(
+            f"    {name:<15} detection={detection_rate*100:5.1f}% "
+            f"decoy_in_stolen={avg_decoy_ratio*100:5.2f}%"
+        )
 
     # ── False Positive Rate (legitimate user simulation) ───────
-    print("\n[B] Estimating false positive rate (legitimate access)...")
+    print("  Legitimate-access false positive check")
     # Legitimate user accesses a small random batch from the clean dataset
     n_legit_trials = 100
     fp_count = 0
@@ -397,25 +390,24 @@ def run_full_detection_experiment(X_injected: np.ndarray,
 
     fpr = fp_count / n_legit_trials
     results['false_positive_rate'] = fpr
-    print(f"  False Positive Rate: {fpr*100:.2f}%  (target < 5%)")
+    print(f"    false_positive_rate={fpr*100:.2f}%")
 
     # ── Baselines ─────────────────────────────────────────────
-    print("\n[C] Baseline comparisons...")
+    print("  Baseline models")
     results['baseline_rf_clean']    = baseline_random_forest(
         X_train_clean, y_train_clean, X_test_clean, y_test_clean,
         label="RF on clean data (no decoys)")
 
+    known_real_mask = ~is_decoy
     results['baseline_rf_injected'] = baseline_random_forest(
-        X_injected, y_injected, X_test_clean, y_test_clean,
-        label="RF on injected data (with decoys)")
+        X_injected[known_real_mask], y_injected[known_real_mask], X_test_clean, y_test_clean,
+        label="RF on injected data (known decoys filtered)")
 
     results['baseline_iforest'] = baseline_isolation_forest(
         X_train_clean, X_test_clean, y_test_clean)
 
     # ── Summary table ─────────────────────────────────────────
-    print("\n" + "="*60)
-    print("RESULTS SUMMARY")
-    print("="*60)
+    print("\n[Summary]")
 
     summary_rows = []
     for attack_name in [k for k in results if k.startswith(('bulk', 'target', 'mimicry', 'slow'))]:
@@ -428,15 +420,15 @@ def run_full_detection_experiment(X_injected: np.ndarray,
         })
 
     summary_df = pd.DataFrame(summary_rows)
-    print(summary_df.to_string(index=False))
+    print(summary_df[['Attack', 'Detection Rate', 'Decoy in Stolen']].to_string(index=False))
 
-    print(f"\n  False Positive Rate : {results['false_positive_rate']*100:.2f}%")
-    print(f"\n  Baseline RF AUC-ROC (clean)    : {results['baseline_rf_clean']['auc_roc']:.4f}")
-    print(f"  Baseline RF AUC-ROC (injected) : {results['baseline_rf_injected']['auc_roc']:.4f}")
-    roc_delta = abs(results['baseline_rf_clean']['auc_roc'] - results['baseline_rf_injected']['auc_roc'])
-    print(f"  AUC-ROC degradation from decoys: {roc_delta:.4f}  (target < 0.01)")
-    print(f"\n  Isolation Forest AUC-ROC       : {results['baseline_iforest']['auc_roc']:.4f}")
-    print(f"  (Canary detects slow theft; IsolationForest does not.)")
+    print(f"\n  False positive rate: {results['false_positive_rate']*100:.2f}%")
+    print(f"  RF AUC-ROC clean   : {results['baseline_rf_clean']['auc_roc']:.4f}")
+    print(f"  RF AUC-ROC injected: {results['baseline_rf_injected']['auc_roc']:.4f}")
+    roc_delta = results['baseline_rf_clean']['auc_roc'] - results['baseline_rf_injected']['auc_roc']
+    degradation = max(0.0, roc_delta)
+    print(f"  AUC-ROC degradation: {degradation:.4f}  (target < 0.01)")
+    print(f"  Isolation Forest AUC-ROC: {results['baseline_iforest']['auc_roc']:.4f}")
 
     return results
 
